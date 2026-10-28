@@ -1,0 +1,139 @@
+name: Flag unlinked PR
+
+# Reusable workflow. Labels a pull request `needs-issue` when it changes more
+# than docs and doesn't link an issue. It never fails the run and never closes
+# the PR: it only flags. Fixing the PR (linking an issue) removes the label.
+#
+# PRs from people with write access and from bots are skipped.
+#
+# Call it from a repository with:
+#
+#   on:
+#     pull_request_target:
+#       types: [opened, edited, reopened, synchronize]
+#   permissions:
+#     issues: write
+#     pull-requests: write
+#   jobs:
+#     flag:
+#       uses: eduralph/.github/.github/workflows/flag-unlinked-pr.yml@main
+#
+# pull_request_target is needed so the token can label PRs from forks. This
+# workflow never checks out or runs the PR's code, which keeps that safe.
+
+on:
+  workflow_call:
+    inputs:
+      skip-trusted:
+        description: Skip PRs from bots and people with write access. Set false only to test.
+        type: boolean
+        default: true
+
+jobs:
+  flag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          SKIP_TRUSTED: ${{ inputs.skip-trusted }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const number = pr.number;
+            const LABEL = 'needs-issue';
+            const MARKER = '<!-- flag-unlinked-pr -->';
+
+            if (process.env.SKIP_TRUSTED === 'true') {
+              if (pr.user.type === 'Bot') {
+                core.info(`${pr.user.login} is a bot — skipped.`);
+                return;
+              }
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pr.author_association)) {
+                core.info(`Author is ${pr.author_association} — skipped.`);
+                return;
+              }
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel(
+                  { owner, repo, username: pr.user.login });
+                if (['admin', 'maintain', 'write'].includes(data.permission)) {
+                  core.info(`Author has ${data.permission} access — skipped.`);
+                  return;
+                }
+              } catch (e) {
+                core.info(`Could not read author permission (${e.message}).`);
+              }
+            }
+
+            async function unflag(reason) {
+              core.info(reason);
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: LABEL });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+            }
+
+            // Typo and docs fixes don't need an issue.
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: number, per_page: 100 });
+            const isDoc = f => /\.(md|markdown|rst|txt|adoc)$/i.test(f) || f.startsWith('docs/');
+            if (files.length > 0 && files.every(f => isDoc(f.filename))) {
+              return unflag('Docs-only change — no issue needed.');
+            }
+
+            // Linked via a closing keyword or the Development sidebar.
+            const res = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) { closingIssuesReferences(first: 1) { totalCount } }
+                }
+              }`, { owner, repo, number });
+            if (res.repository.pullRequest.closingIssuesReferences.totalCount > 0) {
+              return unflag('PR closes an issue — OK.');
+            }
+
+            // Any other reference in the title or body: #N, owner/repo#N or an
+            // issue URL. Each one must resolve to an issue, not a PR.
+            const text = `${pr.title}\n${pr.body || ''}`
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/^\s*(```|~~~)[\s\S]*?^\s*\1/gm, '');
+            const refs = [];
+            for (const m of text.matchAll(/(?:([\w.-]+)\/([\w.-]+))?#(\d+)/g)) {
+              refs.push({ owner: m[1] || owner, repo: m[2] || repo, issue_number: Number(m[3]) });
+            }
+            for (const m of text.matchAll(/github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)/g)) {
+              refs.push({ owner: m[1], repo: m[2], issue_number: Number(m[3]) });
+            }
+            for (const r of refs.slice(0, 10)) {
+              try {
+                const { data } = await github.rest.issues.get(r);
+                if (!data.pull_request) {
+                  return unflag(`PR references issue ${r.owner}/${r.repo}#${r.issue_number} — OK.`);
+                }
+              } catch (e) {
+                core.info(`${r.owner}/${r.repo}#${r.issue_number} could not be read (${e.message}).`);
+              }
+            }
+
+            core.info('No linked issue — flagging.');
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: LABEL, color: 'd93f0b',
+                description: 'Code change without a linked issue' });
+            } catch (e) {
+              if (e.status !== 422) throw e;  // 422: label already exists
+            }
+            await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [LABEL] });
+
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: number, per_page: 100 });
+            if (!comments.some(c => (c.body || '').includes(MARKER))) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body:
+                `${MARKER}\nThanks for the pull request. It changes code but doesn't link an issue, ` +
+                `so it's labelled \`${LABEL}\` and won't be reviewed yet.\n\n` +
+                `Please open an issue describing the problem (or find an existing one), wait for a ` +
+                `maintainer to agree, then add \`Closes #123\` or \`Refs #123\` to this PR's ` +
+                `description. The label is removed automatically once the PR links an issue.\n\n` +
+                `See [CONTRIBUTING.md](https://github.com/${owner}/.github/blob/main/CONTRIBUTING.md) ` +
+                `for details.` });
+            }
